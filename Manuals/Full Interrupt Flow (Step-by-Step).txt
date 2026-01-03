@@ -1,71 +1,72 @@
 ** Full Interrupt Flow (Step-by-Step Diagram)**
 
 ┌────────────────────────────┐
-│ External / Timer Interrupt            │
-│  ext_intr_i / timer_intr_i            │
+│ External / Timer Interrup  │
+│  ext_intr_i / timer_intr_i │
 └──────────────┬─────────────┘
                │
                ▼
 ┌────────────────────────────┐
-│ Set pending bit in MIP                │
-│  - MEIP / MTIP                        │
-│  - or SEIP / STIP                     │
-│  (via delegation)                     │
+│ Set pending bit in MIP     │
+│  - MEIP / MTIP             │
+│  - or SEIP / STIP          │
+│  (via delegation)          │
 └──────────────┬─────────────┘
                │
                ▼
 ┌────────────────────────────┐
-│ Masking & Enable Check                │
-│  MIP & MIE                            │
-│  + MIE/SIE bits in mstatus            │
+│ Masking & Enable Check     │
+│  MIP & MIE                 │
+│  + MIE/SIE bits in mstatus │
 └──────────────┬─────────────┘
                │
                ▼
 ┌────────────────────────────┐
-│ Interrupt Qualified?                  │
-│  YES → take_interrupt_o               │
-│  NO  → ignored                        │
+│ Interrupt Qualified?       │
+│  YES → take_interrupt_o    │
+│  NO  → ignored             │
 └──────────────┬─────────────┘
                │
                ▼
 ┌────────────────────────────────────────┐
-│ Decide Target Privilege                               │
-│  if delegated → Supervisor (S)                        │
-│  else         → Machine (M)                           │
+│ Decide Target Privilege                │
+│  if delegated → Supervisor (S)         │
+│  else         → Machine (M)            │
 └──────────────┬─────────────────────────┘
                │
                ▼
 ┌────────────────────────────────────────┐
-│ Save CPU State                                        │
-│  - EPC   ← PC                                         │
-│  - CAUSE ← interrupt reason                           |
-│  - TVAL  ← optional info             				    │
-│  - MPP/SPP ← old privilege          				    │
-│  - MPIE/SPIE ← old IE               				    │
-│  - Disable interrupts (MIE/SIE = 0)     				│
+│ Save CPU State                         │
+│  - EPC   ← PC                          │
+│  - CAUSE ← interrupt reason            |
+│  - TVAL  ← optional info             	 │
+│  - MPP/SPP ← old privilege          	 │
+│  - MPIE/SPIE ← old IE               	 │
+│  - Disable interrupts (MIE/SIE = 0)    │
 └──────────────┬─────────────────────────┘
                │
                ▼
 ┌────────────────────────────────────────┐
-│ Jump to Handler                                       │
-│  PC ← MTVEC or STVEC                                  │
+│ Jump to Handler                        │
+│  PC ← MTVEC or STVEC                   │
 └──────────────┬─────────────────────────┘
                │
                ▼
 ┌────────────────────────────────────────┐
-│ Execute Interrupt Handler                             │
-│  (OS / firmware code)                                 │
+│ Execute Interrupt Handler              │
+│  (OS / firmware code)                  │
 └──────────────┬─────────────────────────┘
                │
                ▼
 ┌────────────────────────────────────────┐
-│ xRET (MRET / SRET)                     		    	│
-│  - Restore privilege                				    │
-│  - Restore interrupt enable           				│
-│  - PC ← EPC                            				│
+│ xRET (MRET / SRET)                     │
+│  - Restore privilege                   │
+│  - Restore interrupt enable            │
+│  - PC ← EPC                            │
 └──────────────┬─────────────────────────┘
                │
                ▼
 ┌────────────────────────────┐
-│ Resume normal execution              │
+│ Resume normal execution    │
+|                            |
 └────────────────────────────┘
