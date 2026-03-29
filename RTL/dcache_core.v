@@ -13,10 +13,12 @@ module dcache_core
 	,input           mem_invalidate_i
 	,input           mem_writeback_i
 	,input           mem_flush_i
-	,input           outport_accept_i
-	,input           outport_ack_i
-	,input           outport_error_i
-	,input  [ 31:0]  outport_read_data_i
+	// L2 request interface
+	,input           l2_req_ready_i
+	,input           l2_resp_valid_i
+	,input           l2_resp_hit_i
+	,input           l2_resp_error_i
+	,input  [255:0]  l2_resp_rdata_i
 
 	// Snoop inputs
 	,input           snoop_valid_i
@@ -38,11 +40,11 @@ module dcache_core
 	,output          mem_ack_o
 	,output          mem_error_o
 	,output [ 10:0]  mem_resp_tag_o
-	,output [  3:0]  outport_wr_o
-	,output          outport_rd_o
-	,output [  7:0]  outport_len_o
-	,output [ 31:0]  outport_addr_o
-	,output [ 31:0]  outport_write_data_o
+	,output          l2_req_valid_o
+	,output          l2_req_we_o
+	,output [31:0]   l2_req_addr_o
+	,output [255:0]  l2_req_wdata_o
+	,output [31:0]   l2_req_wmask_o
 
 	// Snoop outputs
 	,output          snoop_hit_o
@@ -114,6 +116,15 @@ localparam [1:0] SNOOP_BUSUPGR = 2'd2;
 reg [STATE_W-1:0] next_state_r;
 reg [STATE_W-1:0] state_q;
 
+
+reg        last_wr_valid_q;
+reg [31:0] last_wr_addr_q;
+reg [31:0] last_wr_data_q;
+reg [3:0]  last_wr_strb_q;
+
+reg [2:0]  evict_word_idx_q;
+
+
 //-----------------------------------------------------------------
 // Request buffer
 //-----------------------------------------------------------------
@@ -133,12 +144,6 @@ wire mem_req_i_w =
 	 || mem_invalidate_i
 	 || mem_writeback_i
 	 || mem_flush_i;
-
-//-----------------------------------------------------------------
-// Response holding registers
-//-----------------------------------------------------------------
-reg [31:0] mem_data_rd_q;
-reg [10:0] mem_resp_tag_q;
 
 //-----------------------------------------------------------------
 // Snoop buffer
@@ -219,6 +224,15 @@ assign req_addr_tag_cmp_m_w  = mem_addr_m_q[`DCACHE_TAG_CMP_ADDR_RNG];
 assign snoop_addr_tag_cmp_w  = snoop_addr_q[`DCACHE_TAG_CMP_ADDR_RNG];
 assign snoop_addr_line_w     = snoop_addr_q[`DCACHE_TAG_REQ_RNG];
 
+
+
+//-----------------------------------------------------------------
+// Response holding registers
+//-----------------------------------------------------------------
+reg [31:0] mem_data_rd_q;
+reg [10:0] mem_resp_tag_q;
+
+
 //-----------------------------------------------------------------
 // Registers / Wires
 //-----------------------------------------------------------------
@@ -229,16 +243,21 @@ reg        flush_last_q;
 reg        mem_accept_r;
 reg        mem_ack_r;
 
-wire  [  3:0]  pmem_wr_w;
-wire           pmem_rd_w;
-wire  [  7:0]  pmem_len_w;
-wire           pmem_last_w;
-wire  [ 31:0]  pmem_addr_w;
-wire  [ 31:0]  pmem_write_data_w;
-wire           pmem_accept_w;
-wire           pmem_ack_w;
-wire           pmem_error_w;
-wire  [31:0]   pmem_read_data_w;
+wire           l2_req_fire_w;
+reg            l2_req_valid_r;
+reg            l2_req_we_r;
+reg  [31:0]    l2_req_addr_r;
+reg  [255:0]   l2_req_wdata_r;
+reg  [31:0]    l2_req_wmask_r;
+
+wire           l2_resp_valid_w;
+wire           l2_resp_hit_w;
+wire           l2_resp_error_w;
+wire [255:0]   l2_resp_rdata_w;
+
+reg            l2_wait_resp_q;
+reg  [255:0]   refill_line_q;
+reg            refill_line_valid_q;
 
 wire           evict_way_w;
 wire           tag_modified_any_m_w;
@@ -259,6 +278,53 @@ wire coh_need_busupgr_w;
 wire coh_needed_w;
 wire coh_req_fire_w;
 
+
+
+assign l2_req_fire_w   = l2_req_valid_r && l2_req_ready_i;
+
+assign l2_resp_valid_w = l2_resp_valid_i;
+assign l2_resp_hit_w   = l2_resp_hit_i;
+assign l2_resp_error_w = l2_resp_error_i;
+assign l2_resp_rdata_w = l2_resp_rdata_i;
+
+assign l2_req_valid_o  = l2_req_valid_r;
+assign l2_req_we_o     = l2_req_we_r;
+assign l2_req_addr_o   = l2_req_addr_r;
+assign l2_req_wdata_o  = l2_req_wdata_r;
+assign l2_req_wmask_o  = l2_req_wmask_r;
+
+
+always @ (posedge clk_i or posedge rst_i)
+	if (rst_i)
+	begin
+		last_wr_valid_q <= 1'b0;
+		last_wr_addr_q  <= 32'b0;
+		last_wr_data_q  <= 32'b0;
+		last_wr_strb_q  <= 4'b0;
+	end
+	else if (mem_ack_r && (mem_wr_m_q != 4'b0))
+	begin
+		last_wr_valid_q <= 1'b1;
+		last_wr_addr_q  <= mem_addr_m_q;
+		last_wr_data_q  <= mem_data_m_q;
+		last_wr_strb_q  <= mem_wr_m_q;
+	end
+	else if (mem_ack_r && mem_rd_m_q)
+	begin
+		last_wr_valid_q <= 1'b0;
+	end
+//-----------------------------------------------------------------
+// Data-path helper declarations (must appear before TAG RAM logic)
+//-----------------------------------------------------------------
+localparam CACHE_DATA_ADDR_W = DCACHE_LINE_ADDR_W + DCACHE_LINE_SIZE_W - 2;
+
+reg  [CACHE_DATA_ADDR_W-1:0] data_write_addr_q;
+
+wire [2:0] refill_word_idx_w =
+		data_write_addr_q[2:0];
+
+wire refill_word_last_w =
+		(refill_word_idx_w == (DCACHE_LINE_WORDS-1));
 //-----------------------------------------------------------------
 // TAG RAMS
 //-----------------------------------------------------------------
@@ -353,10 +419,10 @@ begin
 						  (tag0_shared_m_w && coh_upgrade_done_q));
 	else if (state_q == STATE_WRITE)
 		tag0_write_m_r = (replace_way_q == 0);
-	else if (state_q == STATE_EVICT_WAIT && pmem_ack_w)
+	else if (state_q == STATE_EVICT_WAIT && l2_resp_valid_w)
 		tag0_write_m_r = (replace_way_q == 0);
-	else if (state_q == STATE_REFILL)
-		tag0_write_m_r = pmem_ack_w && pmem_last_w && (replace_way_q == 0);
+	else if (state_q == STATE_REFILL && refill_line_valid_q && refill_word_last_w)
+		tag0_write_m_r = (replace_way_q == 0);
 	else if (state_q == STATE_INVALIDATE)
 		tag0_write_m_r = tag0_hit_m_w;
 	else if (state_q == STATE_SNOOP_CHECK && snoop_tag0_hit_w &&
@@ -403,10 +469,10 @@ begin
 						  (tag1_shared_m_w && coh_upgrade_done_q));
 	else if (state_q == STATE_WRITE)
 		tag1_write_m_r = (replace_way_q == 1);
-	else if (state_q == STATE_EVICT_WAIT && pmem_ack_w)
+	else if (state_q == STATE_EVICT_WAIT && l2_resp_valid_w)
 		tag1_write_m_r = (replace_way_q == 1);
-	else if (state_q == STATE_REFILL)
-		tag1_write_m_r = pmem_ack_w && pmem_last_w && (replace_way_q == 1);
+	else if (state_q == STATE_REFILL && refill_line_valid_q && refill_word_last_w)
+		tag1_write_m_r = (replace_way_q == 1);
 	else if (state_q == STATE_INVALIDATE)
 		tag1_write_m_r = tag1_hit_m_w;
 	else if (state_q == STATE_SNOOP_CHECK && snoop_tag1_hit_w &&
@@ -483,8 +549,6 @@ assign tag_modified_any_m_w = 1'b0
 				| (tag0_valid_m_w & tag0_modified_m_w)
 				| (tag1_valid_m_w & tag1_modified_m_w);
 
-
-
 assign miss_w =
 		(mem_rd_m_q || (mem_wr_m_q != 4'b0)) &&
 		!tag_hit_any_m_w;
@@ -553,8 +617,6 @@ always @ (posedge clk_i or posedge rst_i)
 	begin
 		snoop_ack_q <= 1'b0;
 
-		// After acknowledging a snoop, wait until snoop_valid_i drops
-		// so the same snoop is not captured again.
 		if (snoop_wait_drop_q && !snoop_valid_i)
 			snoop_wait_drop_q <= 1'b0;
 
@@ -637,6 +699,7 @@ always @ (posedge clk_i or posedge rst_i)
 assign coh_req_valid_o = coh_req_valid_q;
 assign coh_req_cmd_o   = coh_req_cmd_q;
 assign coh_req_addr_o  = coh_req_addr_q;
+
 //-----------------------------------------------------------------
 // mem_accept logic
 //-----------------------------------------------------------------
@@ -646,16 +709,10 @@ begin
 
 	if (state_q == STATE_LOOKUP && mem_req_i_w)
 	begin
-		// While a snoop is pending or a coherence transaction is in flight,
-		// do not accept a new CPU request.
 		if (snoop_pending_q || coh_req_valid_q || coh_wait_done_q)
 			mem_accept_r = 1'b0;
-
-		// If there is already a buffered request that still needs service,
-		// do not accept another one on top of it.
 		else if (req_pending_w)
 			mem_accept_r = 1'b0;
-
 		else
 			mem_accept_r = 1'b1;
 	end
@@ -665,27 +722,49 @@ assign mem_accept_o = mem_accept_r;
 //-----------------------------------------------------------------
 // DATA RAMS
 //-----------------------------------------------------------------
-localparam CACHE_DATA_ADDR_W = DCACHE_LINE_ADDR_W + DCACHE_LINE_SIZE_W - 2;
+
 
 reg [CACHE_DATA_ADDR_W-1:0] data_addr_x_r;
 reg [CACHE_DATA_ADDR_W-1:0] data_addr_m_r;
-reg [CACHE_DATA_ADDR_W-1:0] data_write_addr_q;
+
 
 wire [31:0] data0_data_out_m_w;
 wire [31:0] data1_data_out_m_w;
 
+wire [CACHE_DATA_ADDR_W-1:0] line_base_addr_w =
+		{mem_addr_m_q[`DCACHE_TAG_REQ_RNG], {(DCACHE_LINE_SIZE_W-2){1'b0}}};
+
+
+wire [31:0] refill_word_data_w =
+		refill_line_q[(refill_word_idx_w * 32) +: 32];
+
 // Data RAM refill write address
 always @ (posedge clk_i or posedge rst_i)
-if (rst_i)
-	data_write_addr_q <= {(CACHE_DATA_ADDR_W){1'b0}};
-else if (state_q != STATE_REFILL && next_state_r == STATE_REFILL)
-	data_write_addr_q <= pmem_addr_w[CACHE_DATA_ADDR_W+2-1:2];
-else if (state_q != STATE_EVICT && next_state_r == STATE_EVICT)
-	data_write_addr_q <= data_addr_m_r + 1;
-else if (state_q == STATE_REFILL && pmem_ack_w)
-	data_write_addr_q <= data_write_addr_q + 1;
-else if (state_q == STATE_EVICT && pmem_accept_w)
-	data_write_addr_q <= data_write_addr_q + 1;
+	if (rst_i)
+	begin
+		data_write_addr_q <= {(CACHE_DATA_ADDR_W){1'b0}};
+		evict_word_idx_q  <= 3'b000;
+	end
+	else if (state_q != STATE_REFILL && next_state_r == STATE_REFILL)
+	begin
+		data_write_addr_q <= line_base_addr_w;
+		evict_word_idx_q  <= 3'b000;
+	end
+	else if (state_q != STATE_EVICT && next_state_r == STATE_EVICT)
+	begin
+		// word0 is already primed by the pre-EVICT address selection
+		data_write_addr_q <= line_base_addr_w + 1'b1;
+		evict_word_idx_q  <= 3'b000;
+	end
+	else if (state_q == STATE_REFILL && refill_line_valid_q && !refill_word_last_w)
+	begin
+		data_write_addr_q <= data_write_addr_q + 1'b1;
+	end
+	else if (state_q == STATE_EVICT && evict_word_idx_q != 3'd7)
+	begin
+		data_write_addr_q <= data_write_addr_q + 1'b1;
+		evict_word_idx_q  <= evict_word_idx_q + 1'b1;
+	end
 
 // Data RAM address
 always @ *
@@ -724,7 +803,7 @@ begin
 	data0_write_m_r = 4'b0;
 
 	if (state_q == STATE_REFILL)
-		data0_write_m_r = (pmem_ack_w && replace_way_q == 0) ? 4'b1111 : 4'b0000;
+		data0_write_m_r = (refill_line_valid_q && replace_way_q == 0) ? 4'b1111 : 4'b0000;
 	else if (state_q == STATE_WRITE)
 		data0_write_m_r = mem_wr_m_q & {4{replace_way_q == 0}};
 	else if (state_q == STATE_LOOKUP)
@@ -734,7 +813,7 @@ begin
 							  (tag0_shared_m_w && coh_upgrade_done_q))}};
 end
 
-wire [31:0] data0_data_in_m_w = (state_q == STATE_REFILL) ? pmem_read_data_w : mem_data_m_q;
+wire [31:0] data0_data_in_m_w = (state_q == STATE_REFILL) ? refill_word_data_w : mem_data_m_q;
 
 dcache_core_data_ram
 u_data0
@@ -760,7 +839,7 @@ begin
 	data1_write_m_r = 4'b0;
 
 	if (state_q == STATE_REFILL)
-		data1_write_m_r = (pmem_ack_w && replace_way_q == 1) ? 4'b1111 : 4'b0000;
+		data1_write_m_r = (refill_line_valid_q && replace_way_q == 1) ? 4'b1111 : 4'b0000;
 	else if (state_q == STATE_WRITE)
 		data1_write_m_r = mem_wr_m_q & {4{replace_way_q == 1}};
 	else if (state_q == STATE_LOOKUP)
@@ -770,7 +849,7 @@ begin
 							  (tag1_shared_m_w && coh_upgrade_done_q))}};
 end
 
-wire [31:0] data1_data_in_m_w = (state_q == STATE_REFILL) ? pmem_read_data_w : mem_data_m_q;
+wire [31:0] data1_data_in_m_w = (state_q == STATE_REFILL) ? refill_word_data_w : mem_data_m_q;
 
 dcache_core_data_ram
 u_data1
@@ -788,7 +867,6 @@ u_data1
   .wr1_i(data1_write_m_r),
   .data1_o()
 );
-
 //-----------------------------------------------------------------
 // Eviction selection
 //-----------------------------------------------------------------
@@ -857,102 +935,148 @@ else if (flush_addr_q == {(DCACHE_TAG_REQ_LINE_W){1'b1}})
 // Replacement Policy
 //-----------------------------------------------------------------
 always @ (posedge clk_i or posedge rst_i)
-if (rst_i)
-	replace_way_q <= 0;
-else if (state_q == STATE_WRITE || state_q == STATE_READ)
-	replace_way_q <= replace_way_q + 1;
-else if (flushing_q && tag_modified_any_m_w && !evict_way_w && state_q != STATE_FLUSH_ADDR)
-	replace_way_q <= replace_way_q + 1;
-else if (state_q == STATE_EVICT_WAIT && next_state_r == STATE_FLUSH_ADDR)
-	replace_way_q <= 0;
-else if (state_q == STATE_FLUSH && next_state_r == STATE_LOOKUP)
-	replace_way_q <= 0;
-else if (state_q == STATE_LOOKUP && next_state_r == STATE_FLUSH_ADDR)
-	replace_way_q <= 0;
-else if (state_q == STATE_WRITEBACK)
-begin
-	case (1'b1)
-	tag0_hit_m_w: replace_way_q <= 0;
-	tag1_hit_m_w: replace_way_q <= 1;
-	endcase
-end
+	if (rst_i)
+		replace_way_q <= 0;
+	else if (state_q == STATE_WRITE || state_q == STATE_READ_RESP)
+		replace_way_q <= replace_way_q + 1'b1;
+	else if (flushing_q && tag_modified_any_m_w && !evict_way_w && state_q != STATE_FLUSH_ADDR)
+		replace_way_q <= replace_way_q + 1'b1;
+	else if (state_q == STATE_EVICT_WAIT && next_state_r == STATE_FLUSH_ADDR)
+		replace_way_q <= 0;
+	else if (state_q == STATE_FLUSH && next_state_r == STATE_LOOKUP)
+		replace_way_q <= 0;
+	else if (state_q == STATE_LOOKUP && next_state_r == STATE_FLUSH_ADDR)
+		replace_way_q <= 0;
+	else if (state_q == STATE_WRITEBACK)
+	begin
+		case (1'b1)
+		tag0_hit_m_w: replace_way_q <= 0;
+		tag1_hit_m_w: replace_way_q <= 1;
+		endcase
+	end
 
 //-----------------------------------------------------------------
 // Output result mux
 //-----------------------------------------------------------------
 reg [31:0] data_r;
+reg [31:0] data_r_raw;
+reg [31:0] read_resp_data_r;
+
 always @ *
 begin
-	data_r = 32'b0;
+	data_r_raw = 32'b0;
 
-	// After refill, return data from the selected refill way,
-	// not from tag-hit detection.
 	if (state_q == STATE_REFILL_WAIT ||
-			state_q == STATE_READ_WAIT   ||
-			state_q == STATE_READ        ||
-			state_q == STATE_READ_RESP)
+		state_q == STATE_READ_WAIT   ||
+		state_q == STATE_READ        ||
+		state_q == STATE_READ_RESP)
 	begin
-		data_r = (replace_way_q == 0) ? data0_data_out_m_w : data1_data_out_m_w;
+		data_r_raw = (replace_way_q == 0) ? data0_data_out_m_w : data1_data_out_m_w;
 	end
-	else begin
+	else
+	begin
 		case (1'b1)
-			tag0_hit_m_w: data_r = data0_data_out_m_w;
-			tag1_hit_m_w: data_r = data1_data_out_m_w;
-			default:      data_r = data0_data_out_m_w;
+			tag0_hit_m_w: data_r_raw = data0_data_out_m_w;
+			tag1_hit_m_w: data_r_raw = data1_data_out_m_w;
+			default:      data_r_raw = data0_data_out_m_w;
 		endcase
+	end
+
+	data_r = data_r_raw;
+	
+
+	// Forward last completed write into an immediate following read of same word
+	if (mem_rd_m_q &&
+		last_wr_valid_q &&
+		(last_wr_addr_q[31:2] == mem_addr_m_q[31:2]))
+	begin
+		if (last_wr_strb_q[0]) data_r[7:0]   = last_wr_data_q[7:0];
+		if (last_wr_strb_q[1]) data_r[15:8]  = last_wr_data_q[15:8];
+		if (last_wr_strb_q[2]) data_r[23:16] = last_wr_data_q[23:16];
+		if (last_wr_strb_q[3]) data_r[31:24] = last_wr_data_q[31:24];
 	end
 end
 
+always @ *
+begin
+	read_resp_data_r = data_r;
+
+	if (last_wr_valid_q &&
+		(last_wr_addr_q[31:2] == mem_addr_m_q[31:2]))
+	begin
+		if (last_wr_strb_q[0]) read_resp_data_r[7:0]   = last_wr_data_q[7:0];
+		if (last_wr_strb_q[1]) read_resp_data_r[15:8]  = last_wr_data_q[15:8];
+		if (last_wr_strb_q[2]) read_resp_data_r[23:16] = last_wr_data_q[23:16];
+		if (last_wr_strb_q[3]) read_resp_data_r[31:24] = last_wr_data_q[31:24];
+	end
+end
 //-----------------------------------------------------------------
 // Read-miss refill capture
 //-----------------------------------------------------------------
-
 reg read_from_refill_q;
+reg refill_data_valid_q;
 
-wire [2:0] refill_req_word_idx_w = mem_addr_m_q[4:2];
-wire [2:0] refill_cur_word_idx_w = data_write_addr_q[2:0];
+wire [2:0] refill_req_word_idx_w  = mem_addr_m_q[4:2];
+wire [2:0] refill_cur_word_idx_w  = data_write_addr_q[2:0];
+wire [31:0] refill_req_word_data_w =
+		refill_line_q[(refill_req_word_idx_w * 32) +: 32];
+wire [31:0] l2_resp_req_word_data_w =
+		l2_resp_rdata_w[(refill_req_word_idx_w * 32) +: 32];
+
+wire use_refill_data_w = read_from_refill_q || refill_data_valid_q;
 
 always @ (posedge clk_i or posedge rst_i)
 if (rst_i)
 begin
-	read_from_refill_q <= 1'b0;
-	mem_data_rd_q      <= 32'b0;
-	mem_resp_tag_q     <= 11'b0;
+	read_from_refill_q  <= 1'b0;
+	refill_data_valid_q <= 1'b0;
+	mem_data_rd_q       <= 32'b0;
+	mem_resp_tag_q      <= 11'b0;
 end
 else
 begin
 	// Mark that this request will return data from refill
 	if (state_q != STATE_REFILL && next_state_r == STATE_REFILL && mem_rd_m_q)
-		read_from_refill_q <= 1'b1;
+	begin
+		read_from_refill_q  <= 1'b1;
+		refill_data_valid_q <= 1'b0;
+	end
 
-	// Capture the exact requested word directly into the response register
-	if (state_q == STATE_REFILL && pmem_ack_w &&
+	// Capture requested word immediately when full line returns from L2
+	if (l2_resp_valid_w && read_from_refill_q)
+	begin
+		mem_data_rd_q       <= l2_resp_req_word_data_w;
+		refill_data_valid_q <= 1'b1;
+	end
+
+	// Also allow capture from refill_line_q while refill is being written
+	if (state_q == STATE_REFILL &&
+		refill_line_valid_q &&
 		read_from_refill_q &&
 		(refill_cur_word_idx_w == refill_req_word_idx_w))
 	begin
-		mem_data_rd_q <= pmem_read_data_w;
+		mem_data_rd_q       <= refill_req_word_data_w;
+		refill_data_valid_q <= 1'b1;
 	end
 
-	// Normal response/tag capture on ACK
+	// Capture tag on every response
 	if (mem_ack_r)
 	begin
 		mem_resp_tag_q <= mem_tag_m_q;
 
-		// Only normal hits / non-refill reads use data_r here
-		if (mem_rd_m_q && !read_from_refill_q)
-			mem_data_rd_q <= data_r;
+		if (mem_rd_m_q && !use_refill_data_w)
+			mem_data_rd_q <= read_resp_data_r;
 
-		// Read-miss response has been returned
-		if (read_from_refill_q)
-			read_from_refill_q <= 1'b0;
+		read_from_refill_q  <= 1'b0;
+		refill_data_valid_q <= 1'b0;
 	end
 end
 
-assign mem_data_rd_o =
-	(mem_ack_o && mem_rd_m_q && !read_from_refill_q) ? data_r : mem_data_rd_q;
+assign mem_data_rd_o = mem_data_rd_q;
 
 assign mem_resp_tag_o =
 		mem_ack_o ? mem_tag_m_q : mem_resp_tag_q;
+
 //-----------------------------------------------------------------
 // Next State Logic
 //-----------------------------------------------------------------
@@ -1000,7 +1124,7 @@ begin
 				next_state_r = STATE_REFILL;
 		end
 
-		// Upgrade case stays in LOOKUP; write_hit_ok_m_w will now be true and mem_ack_r will assert
+		// Upgrade case stays in LOOKUP
 		else if (coh_done_q && write_hit_shared_m_w)
 			next_state_r = STATE_LOOKUP;
 
@@ -1021,9 +1145,10 @@ begin
 	STATE_SNOOP_CHECK :
 		next_state_r = STATE_LOOKUP;
 
+	// Wait for L2 line response, then walk through 8 words of refill_line_q
 	STATE_REFILL :
 	begin
-		if (pmem_ack_w && pmem_last_w)
+		if (refill_line_valid_q && refill_word_last_w)
 			next_state_r = STATE_REFILL_WAIT;
 	end
 
@@ -1049,19 +1174,21 @@ begin
 	STATE_READ_RESP :
 		next_state_r = STATE_LOOKUP;
 
+	// EVICT issues one line request to L2
 	STATE_EVICT :
 	begin
-		if (pmem_accept_w && pmem_last_w)
+		if (l2_req_fire_w)
 			next_state_r = STATE_EVICT_WAIT;
 	end
 
+	// Wait for writeback response from L2
 	STATE_EVICT_WAIT :
 	begin
-		if (pmem_ack_w && mem_writeback_m_q)
+		if (l2_resp_valid_w && mem_writeback_m_q)
 			next_state_r = STATE_LOOKUP;
-		else if (pmem_ack_w && flushing_q)
+		else if (l2_resp_valid_w && flushing_q)
 			next_state_r = STATE_FLUSH_ADDR;
-		else if (pmem_ack_w)
+		else if (l2_resp_valid_w)
 			next_state_r = STATE_REFILL;
 	end
 
@@ -1102,7 +1229,7 @@ begin
 			mem_ack_r = 1'b1;
 	end
 
-	// Read miss completes here after refill
+	// Read miss completes here after line refill
 	STATE_READ_RESP :
 	begin
 		mem_ack_r = 1'b1;
@@ -1123,7 +1250,7 @@ begin
 	// Writeback request that actually evicted a modified line
 	STATE_EVICT_WAIT :
 	begin
-		if (pmem_ack_w && mem_writeback_m_q)
+		if (l2_resp_valid_w && mem_writeback_m_q)
 			mem_ack_r = 1'b1;
 	end
 
@@ -1134,71 +1261,86 @@ begin
 	endcase
 end
 
-assign mem_ack_o = mem_ack_r;
-
+assign mem_ack_o =
+		(mem_ack_r && !(read_from_refill_q && !refill_data_valid_q));
 //-----------------------------------------------------------------
-// AXI Request
+// L2 request / response handling
 //-----------------------------------------------------------------
-reg pmem_rd_q;
-reg pmem_wr0_q;
+reg [255:0] evict_line_q;
 
+wire [31:0] evict_word_data_w =
+		(replace_way_q == 0) ? data0_data_out_m_w : data1_data_out_m_w;
+
+wire [255:0] evict_line_next_w =
+		(evict_line_q & ~(256'hFFFF_FFFF << (evict_word_idx_q * 32))) |
+		({224'b0, evict_word_data_w} << (evict_word_idx_q * 32));
+
+wire refill_request_w = (state_q != STATE_REFILL && next_state_r == STATE_REFILL);
+wire evict_request_w  = (state_q == STATE_EVICT) && (evict_word_idx_q == 3'd7);
+
+// L2 request launch / response capture
 always @ (posedge clk_i or posedge rst_i)
 if (rst_i)
-	pmem_rd_q <= 1'b0;
-else if (pmem_rd_w)
-	pmem_rd_q <= ~pmem_accept_w;
+begin
+	l2_req_valid_r      <= 1'b0;
+	l2_req_we_r         <= 1'b0;
+	l2_req_addr_r       <= 32'b0;
+	l2_req_wdata_r      <= 256'b0;
+	l2_req_wmask_r      <= 32'b0;
+	l2_wait_resp_q      <= 1'b0;
+	refill_line_q       <= 256'b0;
+	refill_line_valid_q <= 1'b0;
+	evict_line_q        <= 256'b0;
+end
+else
+begin
+	// When refill writing completes, drop refill_line_valid_q
+	if (state_q == STATE_REFILL && refill_line_valid_q && refill_word_last_w)
+		refill_line_valid_q <= 1'b0;
 
-always @ (posedge clk_i or posedge rst_i)
-if (rst_i)
-	pmem_wr0_q <= 1'b0;
-else if (state_q != STATE_EVICT && next_state_r == STATE_EVICT)
-	pmem_wr0_q <= 1'b1;
-else if (pmem_accept_w)
-	pmem_wr0_q <= 1'b0;
+	// Collect dirty line word-by-word during EVICT
+	if (state_q == STATE_EVICT)
+		evict_line_q <= evict_line_next_w;
 
-reg [7:0] pmem_len_q;
-always @ (posedge clk_i or posedge rst_i)
-if (rst_i)
-	pmem_len_q <= 8'b0;
-else if (state_q != STATE_EVICT && next_state_r == STATE_EVICT)
-	pmem_len_q <= 8'd7;
-else if (pmem_rd_w && pmem_accept_w)
-	pmem_len_q <= pmem_len_w;
-else if (state_q == STATE_REFILL && pmem_ack_w)
-	pmem_len_q <= pmem_len_q - 8'd1;
-else if (state_q == STATE_EVICT && pmem_accept_w)
-	pmem_len_q <= pmem_len_q - 8'd1;
+	// Launch refill read request once
+	if (refill_request_w && !l2_req_valid_r && !l2_wait_resp_q)
+	begin
+		l2_req_valid_r <= 1'b1;
+		l2_req_we_r    <= 1'b0;
+		l2_req_addr_r  <= {mem_addr_m_q[31:DCACHE_LINE_SIZE_W], {(DCACHE_LINE_SIZE_W){1'b0}}};
+		l2_req_wdata_r <= 256'b0;
+		l2_req_wmask_r <= 32'b0;
+	end
+	// Launch evict / writeback request after the last word was assembled
+	else if (evict_request_w && !l2_req_valid_r && !l2_wait_resp_q)
+	begin
+		l2_req_valid_r <= 1'b1;
+		l2_req_we_r    <= 1'b1;
+		l2_req_addr_r  <= {evict_addr_w, {(DCACHE_LINE_SIZE_W){1'b0}}};
+		l2_req_wdata_r <= evict_line_next_w;
+		l2_req_wmask_r <= 32'hFFFF_FFFF;
+	end
 
-assign pmem_last_w = (pmem_len_q == 8'd0);
+	// Request accepted by L2
+	if (l2_req_fire_w)
+	begin
+		l2_req_valid_r <= 1'b0;
+		l2_wait_resp_q <= 1'b1;
+	end
 
-reg [31:0] pmem_addr_q;
-always @ (posedge clk_i or posedge rst_i)
-if (rst_i)
-	pmem_addr_q <= 32'b0;
-else if (|pmem_len_w && pmem_accept_w)
-	pmem_addr_q <= pmem_addr_w + 32'd4;
-else if (pmem_accept_w)
-	pmem_addr_q <= pmem_addr_q + 32'd4;
+	// L2 response received
+	if (l2_wait_resp_q && l2_resp_valid_w)
+	begin
+		l2_wait_resp_q <= 1'b0;
 
-//-----------------------------------------------------------------
-// Skid buffer for write data
-//-----------------------------------------------------------------
-reg [3:0]  pmem_wr_q;
-reg [31:0] pmem_write_data_q;
-
-always @ (posedge clk_i or posedge rst_i)
-if (rst_i)
-	pmem_wr_q <= 4'b0;
-else if ((|pmem_wr_w) && !pmem_accept_w)
-	pmem_wr_q <= pmem_wr_w;
-else if (pmem_accept_w)
-	pmem_wr_q <= 4'b0;
-
-always @ (posedge clk_i or posedge rst_i)
-if (rst_i)
-	pmem_write_data_q <= 32'b0;
-else if (!pmem_accept_w)
-	pmem_write_data_q <= pmem_write_data_w;
+		// For refill: store full line, then STATE_REFILL writes it word-by-word to data RAM
+		if (state_q == STATE_REFILL || next_state_r == STATE_REFILL)
+		begin
+			refill_line_q       <= l2_resp_rdata_w;
+			refill_line_valid_q <= 1'b1;
+		end
+	end
+end
 
 //-----------------------------------------------------------------
 // Error handling
@@ -1207,39 +1349,12 @@ reg error_q;
 always @ (posedge clk_i or posedge rst_i)
 if (rst_i)
 	error_q <= 1'b0;
-else if (pmem_ack_w && pmem_error_w)
+else if (l2_wait_resp_q && l2_resp_valid_w && l2_resp_error_w)
 	error_q <= 1'b1;
 else if (mem_ack_o)
 	error_q <= 1'b0;
 
 assign mem_error_o = error_q;
-
-//-----------------------------------------------------------------
-// Outport
-//-----------------------------------------------------------------
-wire refill_request_w = (state_q != STATE_REFILL && next_state_r == STATE_REFILL);
-wire evict_request_w  = (state_q == STATE_EVICT) && (evict_way_w || mem_writeback_m_q);
-
-assign pmem_rd_w         = (refill_request_w || pmem_rd_q);
-assign pmem_wr_w         = (evict_request_w || (|pmem_wr_q)) ? 4'hF : 4'b0;
-assign pmem_addr_w       = (|pmem_len_w) ?
-						   (pmem_rd_w ? {mem_addr_m_q[31:DCACHE_LINE_SIZE_W], {(DCACHE_LINE_SIZE_W){1'b0}}} :
-										{evict_addr_w, {(DCACHE_LINE_SIZE_W){1'b0}}}) :
-						   pmem_addr_q;
-
-assign pmem_len_w        = (refill_request_w || pmem_rd_q || (state_q == STATE_EVICT && pmem_wr0_q)) ? 8'd7 : 8'd0;
-assign pmem_write_data_w = (|pmem_wr_q) ? pmem_write_data_q : evict_data_w;
-
-assign outport_wr_o         = pmem_wr_w;
-assign outport_rd_o         = pmem_rd_w;
-assign outport_len_o        = pmem_len_w;
-assign outport_addr_o       = pmem_addr_w;
-assign outport_write_data_o = pmem_write_data_w;
-
-assign pmem_accept_w        = outport_accept_i;
-assign pmem_ack_w           = outport_ack_i;
-assign pmem_error_w         = outport_error_i;
-assign pmem_read_data_w     = outport_read_data_i;
 
 //-------------------------------------------------------------------
 // Debug
@@ -1266,7 +1381,8 @@ begin
 	STATE_SNOOP_REQ:   dbg_state = "SNOOP_REQ";
 	STATE_SNOOP_CHECK: dbg_state = "SNOOP_CHECK";
 	STATE_REFILL_WAIT: dbg_state = "REFILL_WAIT";
-	STATE_READ_RESP: dbg_state = "READ_RESP";
+	STATE_READ_WAIT:   dbg_state = "READ_WAIT";
+	STATE_READ_RESP:   dbg_state = "READ_RESP";
 	default:           ;
 	endcase
 end
