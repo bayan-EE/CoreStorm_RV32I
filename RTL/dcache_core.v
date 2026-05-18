@@ -88,25 +88,29 @@ localparam DCACHE_TAG_CMP_ADDR_W     = DCACHE_TAG_CMP_ADDR_H - DCACHE_TAG_CMP_AD
 //-----------------------------------------------------------------
 // States
 //-----------------------------------------------------------------
-localparam STATE_W           = 4;
-localparam STATE_RESET       = 4'd0;
-localparam STATE_FLUSH_ADDR  = 4'd1;
-localparam STATE_FLUSH       = 4'd2;
-localparam STATE_LOOKUP      = 4'd3;
-localparam STATE_READ        = 4'd4;
-localparam STATE_WRITE       = 4'd5;
-localparam STATE_REFILL      = 4'd6;
-localparam STATE_EVICT       = 4'd7;
-localparam STATE_EVICT_WAIT  = 4'd8;
-localparam STATE_INVALIDATE  = 4'd9;
-localparam STATE_WRITEBACK   = 4'd10;
-localparam STATE_SNOOP_REQ   = 4'd11;
-localparam STATE_SNOOP_CHECK = 4'd12;
-localparam STATE_REFILL_WAIT = 4'd13;
-localparam STATE_READ_WAIT = 4'd14;
-localparam STATE_READ_RESP = 4'd15;
+localparam STATE_W              = 5;
 
+localparam STATE_RESET          = 5'd0;
+localparam STATE_FLUSH_ADDR     = 5'd1;
+localparam STATE_FLUSH          = 5'd2;
+localparam STATE_LOOKUP         = 5'd3;
+localparam STATE_READ           = 5'd4;
+localparam STATE_WRITE          = 5'd5;
+localparam STATE_REFILL         = 5'd6;
+localparam STATE_EVICT          = 5'd7;
+localparam STATE_EVICT_WAIT     = 5'd8;
+localparam STATE_INVALIDATE     = 5'd9;
+localparam STATE_WRITEBACK      = 5'd10;
+localparam STATE_SNOOP_REQ      = 5'd11;
+localparam STATE_SNOOP_CHECK    = 5'd12;
+localparam STATE_REFILL_WAIT    = 5'd13;
+localparam STATE_READ_WAIT      = 5'd14;
+localparam STATE_READ_RESP      = 5'd15;
 
+// New states for dirty snoop writeback to L2
+localparam STATE_SNOOP_WRITEBACK      = 5'd16;
+localparam STATE_SNOOP_WRITEBACK_WAIT = 5'd17;
+localparam STATE_SNOOP_WRITEBACK_SEND = 5'd18;
 
 // Snoop commands
 localparam [1:0] SNOOP_BUSRD   = 2'd0;
@@ -156,6 +160,12 @@ reg        snoop_wait_drop_q;
 reg        snoop_hit_q;
 reg        snoop_dirty_q;
 reg        snoop_ack_q;
+
+reg [2:0]    snoop_wb_word_idx_q;
+reg [255:0]  snoop_wb_line_q;
+reg [255:0]  snoop_wb_line_final_q;
+reg          snoop_wb_way_q;
+reg [255:0]  snoop_wb_line_to_l2_r;
 
 wire snoop_tag0_hit_w;
 wire snoop_tag1_hit_w;
@@ -626,11 +636,19 @@ always @ (posedge clk_i or posedge rst_i)
 			snoop_addr_q    <= snoop_addr_i;
 			snoop_cmd_q     <= snoop_cmd_i;
 		end
-		else if (state_q == STATE_SNOOP_CHECK)
+		else if (state_q == STATE_SNOOP_CHECK && !(snoop_busrd_w && snoop_dirty_any_w))
 		begin
 			snoop_pending_q   <= 1'b0;
 			snoop_hit_q       <= snoop_hit_any_w;
 			snoop_dirty_q     <= snoop_dirty_any_w;
+			snoop_ack_q       <= 1'b1;
+			snoop_wait_drop_q <= 1'b1;
+		end
+		else if (state_q == STATE_SNOOP_WRITEBACK_WAIT && l2_resp_valid_w)
+		begin
+			snoop_pending_q   <= 1'b0;
+			snoop_hit_q       <= 1'b1;
+			snoop_dirty_q     <= 1'b1;
 			snoop_ack_q       <= 1'b1;
 			snoop_wait_drop_q <= 1'b1;
 		end
@@ -730,6 +748,30 @@ reg [CACHE_DATA_ADDR_W-1:0] data_addr_m_r;
 
 wire [31:0] data0_data_out_m_w;
 wire [31:0] data1_data_out_m_w;
+wire [7:0] last_wr_bit_base_w = {last_wr_addr_q[4:2], 5'b00000};
+
+always @ *
+begin
+	snoop_wb_line_to_l2_r = snoop_wb_line_final_q;
+
+	// Patch the most recent completed store into the snoop writeback line.
+	// This prevents X from the data RAM timing path from being written to L2.
+	if (last_wr_valid_q &&
+		(last_wr_addr_q[31:5] == snoop_addr_q[31:5]))
+	begin
+		if (last_wr_strb_q[0])
+			snoop_wb_line_to_l2_r[last_wr_bit_base_w +: 8] = last_wr_data_q[7:0];
+
+		if (last_wr_strb_q[1])
+			snoop_wb_line_to_l2_r[(last_wr_bit_base_w + 8) +: 8] = last_wr_data_q[15:8];
+
+		if (last_wr_strb_q[2])
+			snoop_wb_line_to_l2_r[(last_wr_bit_base_w + 16) +: 8] = last_wr_data_q[23:16];
+
+		if (last_wr_strb_q[3])
+			snoop_wb_line_to_l2_r[(last_wr_bit_base_w + 24) +: 8] = last_wr_data_q[31:24];
+	end
+end
 
 wire [CACHE_DATA_ADDR_W-1:0] line_base_addr_w =
 		{mem_addr_m_q[`DCACHE_TAG_REQ_RNG], {(DCACHE_LINE_SIZE_W-2){1'b0}}};
@@ -773,6 +815,11 @@ begin
 	begin
 		data_addr_x_r = data_write_addr_q;
 		data_addr_m_r = data_write_addr_q;
+	end
+	else if (state_q == STATE_SNOOP_WRITEBACK)
+	begin
+		data_addr_x_r = {snoop_addr_q[`DCACHE_TAG_REQ_RNG], snoop_wb_word_idx_q};
+		data_addr_m_r = data_addr_x_r;
 	end
 	else if (state_q == STATE_FLUSH || state_q == STATE_RESET)
 	begin
@@ -1059,12 +1106,12 @@ begin
 		refill_data_valid_q <= 1'b1;
 	end
 
-	// Capture tag on every response
+	// Capture tag and read data on every completed response
 	if (mem_ack_r)
 	begin
 		mem_resp_tag_q <= mem_tag_m_q;
 
-		if (mem_rd_m_q && !use_refill_data_w)
+		if (mem_rd_m_q)
 			mem_data_rd_q <= read_resp_data_r;
 
 		read_from_refill_q  <= 1'b0;
@@ -1072,7 +1119,13 @@ begin
 	end
 end
 
-assign mem_data_rd_o = mem_data_rd_q;
+wire [31:0] mem_data_rd_now_w;
+
+assign mem_data_rd_now_w =
+	(mem_ack_r && mem_rd_m_q) ? read_resp_data_r :
+								mem_data_rd_q;
+
+assign mem_data_rd_o = mem_data_rd_now_w;
 
 assign mem_resp_tag_o =
 		mem_ack_o ? mem_tag_m_q : mem_resp_tag_q;
@@ -1140,10 +1193,39 @@ begin
 	end
 
 	STATE_SNOOP_REQ :
-		next_state_r = STATE_SNOOP_CHECK;
+			next_state_r = STATE_SNOOP_CHECK;
 
 	STATE_SNOOP_CHECK :
-		next_state_r = STATE_LOOKUP;
+	begin
+		if (snoop_busrd_w && snoop_dirty_any_w)
+			next_state_r = STATE_SNOOP_WRITEBACK;
+		else
+			next_state_r = STATE_LOOKUP;
+	end
+	
+	STATE_SNOOP_WRITEBACK :
+	begin
+		if (snoop_wb_word_idx_q == 3'd7)
+			next_state_r = STATE_SNOOP_WRITEBACK_SEND;
+		else
+			next_state_r = STATE_SNOOP_WRITEBACK;
+	end
+
+	STATE_SNOOP_WRITEBACK_SEND :
+	begin
+		if (l2_req_fire_w)
+			next_state_r = STATE_SNOOP_WRITEBACK_WAIT;
+		else
+			next_state_r = STATE_SNOOP_WRITEBACK_SEND;
+	end
+
+	STATE_SNOOP_WRITEBACK_WAIT :
+	begin
+		if (l2_resp_valid_w)
+			next_state_r = STATE_LOOKUP;
+		else
+			next_state_r = STATE_SNOOP_WRITEBACK_WAIT;
+	end
 
 	// Wait for L2 line response, then walk through 8 words of refill_line_q
 	STATE_REFILL :
@@ -1275,23 +1357,28 @@ wire [255:0] evict_line_next_w =
 		(evict_line_q & ~(256'hFFFF_FFFF << (evict_word_idx_q * 32))) |
 		({224'b0, evict_word_data_w} << (evict_word_idx_q * 32));
 
-wire refill_request_w = (state_q != STATE_REFILL && next_state_r == STATE_REFILL);
-wire evict_request_w  = (state_q == STATE_EVICT) && (evict_word_idx_q == 3'd7);
+wire refill_request_w  = (state_q != STATE_REFILL && next_state_r == STATE_REFILL);
+wire evict_request_w   = (state_q == STATE_EVICT) && (evict_word_idx_q == 3'd7);
+wire snoop_wb_request_w = (state_q == STATE_SNOOP_WRITEBACK_SEND);
 
 // L2 request launch / response capture
 always @ (posedge clk_i or posedge rst_i)
-if (rst_i)
-begin
-	l2_req_valid_r      <= 1'b0;
-	l2_req_we_r         <= 1'b0;
-	l2_req_addr_r       <= 32'b0;
-	l2_req_wdata_r      <= 256'b0;
-	l2_req_wmask_r      <= 32'b0;
-	l2_wait_resp_q      <= 1'b0;
-	refill_line_q       <= 256'b0;
-	refill_line_valid_q <= 1'b0;
-	evict_line_q        <= 256'b0;
-end
+	if (rst_i)
+	begin
+		l2_req_valid_r        <= 1'b0;
+		l2_req_we_r           <= 1'b0;
+		l2_req_addr_r         <= 32'b0;
+		l2_req_wdata_r        <= 256'b0;
+		l2_req_wmask_r        <= 32'b0;
+		l2_wait_resp_q        <= 1'b0;
+		refill_line_q         <= 256'b0;
+		refill_line_valid_q   <= 1'b0;
+		evict_line_q          <= 256'b0;
+
+		snoop_wb_word_idx_q   <= 3'b000;
+		snoop_wb_line_q       <= 256'b0;
+		snoop_wb_line_final_q <= 256'b0;
+	end
 else
 begin
 	// When refill writing completes, drop refill_line_valid_q
@@ -1301,6 +1388,35 @@ begin
 	// Collect dirty line word-by-word during EVICT
 	if (state_q == STATE_EVICT)
 		evict_line_q <= evict_line_next_w;
+	
+	// Collect dirty line word-by-word during snoop BusRd intervention
+	if (state_q == STATE_SNOOP_CHECK && next_state_r == STATE_SNOOP_WRITEBACK)
+	begin
+		snoop_wb_word_idx_q   <= 3'b000;
+		snoop_wb_line_q       <= 256'b0;
+		snoop_wb_line_final_q <= 256'b0;
+		snoop_wb_way_q        <= snoop_tag1_hit_w; // 0 = way0, 1 = way1
+
+	end
+	else if (state_q == STATE_SNOOP_WRITEBACK)
+	begin
+		snoop_wb_line_q <=
+			(snoop_wb_line_q & ~(256'hFFFF_FFFF << (snoop_wb_word_idx_q * 32))) |
+			({224'b0, (snoop_wb_way_q ? data1_data_out_m_w : data0_data_out_m_w)}
+			 << (snoop_wb_word_idx_q * 32));
+
+		if (snoop_wb_word_idx_q == 3'd7)
+		begin
+			snoop_wb_line_final_q <=
+				(snoop_wb_line_q & ~(256'hFFFF_FFFF << (snoop_wb_word_idx_q * 32))) |
+				({224'b0, (snoop_wb_way_q ? data1_data_out_m_w : data0_data_out_m_w)}
+				 << (snoop_wb_word_idx_q * 32));
+		end
+		else
+		begin
+			snoop_wb_word_idx_q <= snoop_wb_word_idx_q + 1'b1;
+		end
+	end
 
 	// Launch refill read request once
 	if (refill_request_w && !l2_req_valid_r && !l2_wait_resp_q)
@@ -1318,6 +1434,16 @@ begin
 		l2_req_we_r    <= 1'b1;
 		l2_req_addr_r  <= {evict_addr_w, {(DCACHE_LINE_SIZE_W){1'b0}}};
 		l2_req_wdata_r <= evict_line_next_w;
+		l2_req_wmask_r <= 32'hFFFF_FFFF;
+	end
+	
+	// Launch snoop dirty writeback to L2
+	else if (snoop_wb_request_w && !l2_req_valid_r && !l2_wait_resp_q)
+	begin
+		l2_req_valid_r <= 1'b1;
+		l2_req_we_r    <= 1'b1;
+		l2_req_addr_r  <= {snoop_addr_q[31:DCACHE_LINE_SIZE_W], {(DCACHE_LINE_SIZE_W){1'b0}}};
+		l2_req_wdata_r <= snoop_wb_line_to_l2_r;
 		l2_req_wmask_r <= 32'hFFFF_FFFF;
 	end
 
